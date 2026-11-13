@@ -1,0 +1,20 @@
+.build-venv/
+.build/
+dist/
+__pycache__/
+*.pyc
+*.AppImage
+*.part
+
+# Source repository only; binaries belong in releases, not Git history.
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.iso
+*.wim
+*.msi
+*.msu
+*.cab
+*.log

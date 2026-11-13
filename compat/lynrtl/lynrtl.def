@@ -1,0 +1,10 @@
+LIBRARY lynrtl
+EXPORTS
+ RtlGetCompressionWorkSpaceSize
+ RtlDecompressBufferEx
+ NtClose=ntdll.NtClose
+ NtOpenKey=ntdll.NtOpenKey
+ NtQueryValueKey=ntdll.NtQueryValueKey
+ RtlComputeCrc32=ntdll.RtlComputeCrc32
+ RtlCompressBuffer=ntdll.RtlCompressBuffer
+ RtlInitUnicodeString=ntdll.RtlInitUnicodeString

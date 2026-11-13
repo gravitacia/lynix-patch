@@ -46,7 +46,9 @@ DATA_DIR="${LYNIX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/$APP_ID}"
 CONFIG_DIR="${LYNIX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/$APP_ID}"
 CONFIG_FILE="$CONFIG_DIR/config"
 PROTON_ROOT="$DATA_DIR/proton"
-PREFIX_DIR="$DATA_DIR/prefix"
+# LYNIX_PREFIX lets the wrapper reuse an existing Proton prefix, for example a
+# Steam compatdata folder that already has WebView2 and the VC++ runtime.
+PREFIX_DIR="${LYNIX_PREFIX:-$DATA_DIR/prefix}"
 CACHE_DIR="$DATA_DIR/cache"
 LOG_DIR="$DATA_DIR/logs"
 BACKUP_DIR="$DATA_DIR/backups"
@@ -113,6 +115,8 @@ Options:
 Environment:
   LYNIX_DATA_DIR             Override private data folder
                              (default: \$XDG_DATA_HOME/lynix-proton)
+  LYNIX_PREFIX               Reuse an existing Proton prefix (for example a
+                             Steam compatdata folder) instead of the private one
   LYNIX_CONFIG_DIR           Override settings folder
                              (default: \$XDG_CONFIG_HOME/lynix-proton)
   LYNIX_PROTON               Use this Proton folder without saving it
@@ -294,7 +298,7 @@ die() {
 
 init_dirs() {
   mkdir -p "$CONFIG_DIR" "$PROTON_ROOT" "$PREFIX_DIR" "$CACHE_DIR" "$LOG_DIR" "$FAKE_STEAM/steamapps/common"
-  : >"$LOG_FILE"
+  touch "$LOG_FILE"
   chmod 700 "$CONFIG_DIR" "$DATA_DIR" 2>/dev/null || true
 }
 
@@ -728,7 +732,10 @@ ensure_proton() {
 
 ensure_prefix() {
   mkdir -p "$PREFIX_DIR" "$FAKE_STEAM/steamapps/common"
-  chmod 700 "$PREFIX_DIR" 2>/dev/null || true
+  # Leave an external (Steam) prefix's permissions exactly as Steam expects.
+  if [ -z "${LYNIX_PREFIX:-}" ]; then
+    chmod 700 "$PREFIX_DIR" 2>/dev/null || true
+  fi
 }
 
 configure_cursor_env() {
@@ -776,6 +783,10 @@ proton_env() {
   export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
   export PROTON_LOG=1
   export PROTON_LOG_DIR="$LOG_DIR"
+  # Proton only creates steam-<id>.log when SteamGameId is set.  Without it
+  # PROTON_LOG=1 writes no file at all.  The compatdata folder is named after
+  # the app id, so reuse that for background diagnostics.
+  export SteamGameId="${SteamGameId:-$(basename -- "$PREFIX_DIR")}"
   # WebView2's embedded Chromium can render black when Proton uses its native
   # Wayland driver.  Xwayland is the tested default; opt in only explicitly.
   if [ "${LYNIX_ENABLE_WAYLAND:-0}" != "1" ]; then
@@ -790,15 +801,25 @@ proton_env() {
   mkdir -p "$LOG_DIR"
 }
 
+wine_path() {
+  # GE-Proton hands the executable name to its built-in steam.exe, which
+  # resolves relative names against the Windows system directory rather than
+  # the process working directory.  An absolute Z: path always resolves.
+  local path
+  path="$(readlink -f -- "$1")"
+  printf 'Z:%s' "${path//\//\\}"
+}
+
 run_installer() {
   local exe="$1"
   shift
-  local dir name
+  local dir name win_exe
   dir="$(dirname -- "$exe")"
   name="$(basename -- "$exe")"
+  win_exe="$(wine_path "$exe")"
   log "Running installer: $exe $*"
   proton_env
-  ( cd "$dir" && "$PROTON_DIR/proton" run "$name" "$@" ) </dev/null >>"$LOG_FILE" 2>&1
+  ( cd "$dir" && "$PROTON_DIR/proton" run "$win_exe" "$@" ) </dev/null >>"$LOG_FILE" 2>&1
 }
 
 vc_runtime_version() {
@@ -825,7 +846,9 @@ version_ge_14_51() {
   minor="${ver%%.*}"
   [[ "$major" =~ ^[0-9]+$ ]] || return 1
   [[ "$minor" =~ ^[0-9]+$ ]] || return 1
-  [ "$major" -gt 14 ] || { [ "$major" -eq 14 ] && [ "$minor" -ge 51 ]; }
+  # The official vc_redist.x64.exe from aka.ms currently installs
+  # 14.42.34433.0, so anything >= 14.40 is a current runtime.
+  [ "$major" -gt 14 ] || { [ "$major" -eq 14 ] && [ "$minor" -ge 40 ]; }
 }
 
 vc_runtime_ok() {
@@ -971,37 +994,65 @@ set_webview2_policy() {
   done < <(webview2_policy_hosts)
 }
 
+wine_desktop_settings() {
+  # Keep the UI's normal pointer; games need capture and Windows cursor shapes.
+  cat <<'SETTINGS'
+Software\Wine\X11 Driver|GrabFullscreen|N
+Software\Wine\X11 Driver|UseSystemCursors|Y
+Software\Wine\AppDefaults\RobloxPlayerBeta.exe\X11 Driver|GrabFullscreen|Y
+Software\Wine\AppDefaults\RobloxPlayerBeta.exe\X11 Driver|UseSystemCursors|N
+Software\Wine\AppDefaults\RobloxPlayerBeta.exe\X11 Driver|Managed|Y
+Software\Wine\AppDefaults\RobloxPlayerBeta.exe\DirectInput|MouseWarpOverride|force
+SETTINGS
+}
+
 set_wine_input_settings() {
-  # Explicit X11 driver options:
-  #   GrabFullscreen=N   do not confine the pointer to fullscreen windows
-  #   UseSystemCursors=Y draw standard cursors with the host Xcursor theme
-  # Wine 10 already defaults to these values, but writing them keeps the
-  # behavior stable across Proton/Wine upgrades and prefix re-creation.
-  local reg="$PREFIX_DIR/pfx/user.reg"
-  local driver="HKCU\\Software\\Wine\\X11 Driver"
-  local driver_key='Software\\Wine\\X11 Driver'
-  local need_settings=0
+  local key name value regkey
+  while IFS='|' read -r key name value; do
+    regkey="${key//\\/\\\\}"
+    reg_value_matches "$PREFIX_DIR/pfx/user.reg" "$regkey" "$name" "$value" && continue
+    proton_env
+    log "Setting $key: $name=$value"
+    "$PROTON_DIR/proton" runinprefix 'C:\windows\system32\reg.exe' add \
+      "HKCU\\$key" /v "$name" /t REG_SZ /d "$value" /f </dev/null >>"$LOG_FILE" 2>&1 \
+      || log "WARNING: could not set $key: $name."
+  done < <(wine_desktop_settings)
+}
 
-  reg_value_matches "$reg" "$driver_key" "GrabFullscreen" "N" || need_settings=1
-  reg_value_matches "$reg" "$driver_key" "UseSystemCursors" "Y" || need_settings=1
-  [ "$need_settings" -eq 1 ] || return 0
+run_compat_helper() {
+  if [ -x "$DATA_DIR/runtime/lynix-patch" ]; then
+    "$DATA_DIR/runtime/lynix-patch" --support "$@"
+  else
+    python3 "$@"
+  fi
+}
 
-  log "Configuring Wine pointer and cursor behavior in the private prefix."
-  proton_env
-  "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
-    "$driver" /v GrabFullscreen /t REG_SZ /d N /f </dev/null >>"$LOG_FILE" 2>&1 \
-    || log "WARNING: could not set Wine GrabFullscreen."
-  "$PROTON_DIR/proton" runinprefix "C:\\windows\\system32\\reg.exe" add \
-    "$driver" /v UseSystemCursors /t REG_SZ /d Y /f </dev/null >>"$LOG_FILE" 2>&1 \
-    || log "WARNING: could not set Wine UseSystemCursors."
+setup_progress() {
+  [ "${LYNIX_SETUP_PROGRESS:-0}" = "1" ] || return 0
+  printf 'LYNIX_PROGRESS|%s|%s\n' "$1" "$2"
+}
+
+prepare_desktop_proton() {
+  local helper="$DATA_DIR/compat/prepare-proton.py" prepared
+  [ -f "$helper" ] || return 0
+  if prepared="$(run_compat_helper "$helper" --proton "$PROTON_DIR" --cache "$DATA_DIR/proton-desktop" 2>>"$LOG_FILE")"; then
+    PROTON_DIR="$prepared"
+  else
+    log "WARNING: native borders unavailable for this Proton build; using the selected build."
+  fi
 }
 
 ensure_runtimes() {
+  setup_progress 57 "Preparing the prefix…"
   ensure_prefix
+  setup_progress 60 "Checking / installing Visual C++…"
   ensure_vcredist
+  setup_progress 71 "Checking / installing WebView2…"
   ensure_webview2
+  setup_progress 89 "Applying cursor and startup settings…"
   set_webview2_policy
   set_wine_input_settings
+  setup_progress 92 "Runtime setup complete"
 }
 
 show_status() {
@@ -1207,12 +1258,44 @@ maybe_reset_webview() {
   RESET_WEBVIEW=0
 }
 
+start_game_compat() {
+  local parent_pid="${1:-$$}" compat="$DATA_DIR/compat"
+  [ -f "$compat/roblox-compression.py" ] || return 0
+  { [ -x "$DATA_DIR/runtime/lynix-patch" ] || have python3; } || { log "WARNING: Python 3 is required for the Roblox compression fix."; return 0; }
+  local key='Software\\Wine\\AppDefaults\\RobloxPlayerBeta.exe\\DllOverrides'
+  if ! reg_value_matches "$PREFIX_DIR/pfx/user.reg" "$key" cabinet native,builtin; then
+    proton_env
+    "$PROTON_DIR/proton" runinprefix 'C:\windows\system32\reg.exe' add \
+      'HKCU\Software\Wine\AppDefaults\RobloxPlayerBeta.exe\DllOverrides' \
+      /v cabinet /t REG_SZ /d native,builtin /f </dev/null >>"$LOG_FILE" 2>&1 \
+      || { log "WARNING: could not enable Roblox's native Cabinet DLL."; return 0; }
+  fi
+  run_compat_helper "$compat/roblox-compression.py" --prefix "$PREFIX_DIR" \
+    --assets "$compat" --backups "$BACKUP_DIR/roblox-compression" >>"$LOG_FILE" 2>&1 \
+    || { log "WARNING: could not apply the Roblox compression fix."; return 0; }
+  run_compat_helper "$compat/roblox-compression.py" --prefix "$PREFIX_DIR" \
+    --assets "$compat" --backups "$BACKUP_DIR/roblox-compression" \
+    --parent "$parent_pid" </dev/null >>"$LOG_FILE" 2>&1 &
+}
+
+start_cursor_helper() {
+  local parent_pid="${1:-$$}" compat="$DATA_DIR/compat"
+  [ -n "${DISPLAY:-}" ] || return 0
+  [ -f "$compat/cursor-visibility.py" ] && [ -f "$compat/cursor-state.exe" ] || return 0
+  run_compat_helper "$compat/cursor-visibility.py" --prefix "$PREFIX_DIR" \
+    --wine "$PROTON_DIR/files/bin/wine" --reporter "$compat/cursor-state.exe" \
+    --parent "$parent_pid" </dev/null >>"$LOG_DIR/cursor-helper.log" 2>&1 &
+}
+
 launch_app() {
   [ -f "$EXE_PATH" ] || die "UI.exe was not found:\n$EXE_PATH"
   [ -x "$PROTON_DIR/proton" ] || die "Proton was not found:\n$PROTON_DIR"
 
   local running_pid
   if running_pid="$(app_is_running)"; then
+    set_wine_input_settings
+    start_game_compat "$running_pid"
+    start_cursor_helper "$running_pid"
     log "Lynx is already running (prefix pid $running_pid); not launching a second instance."
     if have wmctrl; then
       wmctrl -a "Lynx" >/dev/null 2>&1 || true
@@ -1226,6 +1309,8 @@ launch_app() {
   ensure_runtimes
   maybe_reset_webview
   clean_stale_app_state
+  start_game_compat
+  start_cursor_helper
 
   proton_env
   log "Launching $EXE_PATH with $(proton_version "$PROTON_DIR") from $PROTON_DIR"
@@ -1234,16 +1319,16 @@ launch_app() {
   fi
 
   local rc=0 retried=0
-  local exe_dir exe_name
+  local exe_dir exe_win
   exe_dir="$(dirname -- "$EXE_PATH")"
-  exe_name="$(basename -- "$EXE_PATH")"
+  exe_win="$(wine_path "$EXE_PATH")"
 
   while :; do
     set +e
-    # Proton launches through its internal steam.exe shim.  It must receive a
-    # name relative to the working directory, not an absolute Unix path, or the
-    # app may start in a broken state and exit shortly afterwards.
-    ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_name" "${PASSTHRU[@]}" ) </dev/null >>"$LOG_FILE" 2>&1
+    # Proton launches through its internal steam.exe shim.  GE-Proton resolves
+    # relative names against the Windows system directory, so pass an absolute
+    # Z: path; cd to the exe folder so the app's relative files still resolve.
+    ( cd "$exe_dir" && "$PROTON_DIR/proton" run "$exe_win" "${PASSTHRU[@]}" ) </dev/null >>"$LOG_FILE" 2>&1
     rc=$?
     set -e
 
@@ -1308,6 +1393,7 @@ main() {
 
   ensure_exe
   ensure_proton
+  prepare_desktop_proton
 
   if [ "$NO_LAUNCH" -eq 1 ]; then
     ensure_runtimes

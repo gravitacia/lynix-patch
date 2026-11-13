@@ -1,0 +1,10 @@
+__pycache__/
+lynrtl/.cargo/
+lynrtl/target/
+lynrtl/*.lib
+lynrtl/*.dll
+lynrtl/*.obj
+lynrtl/*.exe
+cursor/*.lib
+cursor/*.obj
+cursor/*.exe
